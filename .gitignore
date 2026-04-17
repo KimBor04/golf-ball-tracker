@@ -11,12 +11,16 @@ data/extracted_frames/
 data/calibration/
 
 # Models / outputs
+models/
 models/experiments/
 models/final/
 output/
 
 # Notebooks
 .ipynb_checkpoints/
+
+#runs
+runs/
 
 # OS / editor
 .DS_Store
