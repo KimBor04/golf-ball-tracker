@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+
+# Data
+data/raw/
+data/videos/
+data/extracted_frames/
+data/calibration/
+
+# Models / outputs
+models/experiments/
+models/final/
+output/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
