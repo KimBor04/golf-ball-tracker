@@ -12,13 +12,13 @@ def main() -> None:
         project_root
         / "models"
         / "experiments"
-        / "yolo11n_baseline_15ep2"
+        / "yolo11n_baseline_combined_rucv_15ep"
         / "weights"
         / "best.pt"
     )
-    frames_dir = project_root / "data" / "extracted_frames" / "rory_002"
+    frames_dir = project_root / "data" / "extracted_frames" / "rory_001"
 
-    output_dir = project_root / "output" / "detections" / "rory_002"
+    output_dir = project_root / "output" / "detections" / "rory_001"
     annotated_dir = output_dir / "annotated_frames"
     csv_path = output_dir / "detections.csv"
 
@@ -54,7 +54,7 @@ def main() -> None:
         for frame_path in frame_paths:
             results = model.predict(
                 source=str(frame_path),
-                conf=0.25,
+                conf=0.05,
                 iou=0.7,
                 save=False,
                 verbose=False,
