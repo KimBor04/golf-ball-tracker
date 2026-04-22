@@ -78,6 +78,9 @@ class BallTracker:
         self.missed_frames = 0
         self.history: List[TrackPoint] = []
 
+    def is_initialized(self) -> bool:
+        return self.initialized
+
     def initialize(self, x: float, y: float) -> None:
         self.kalman.statePost = np.array(
             [[x], [y], [0], [0]],
@@ -163,10 +166,9 @@ class BallTracker:
         self,
         frame_idx: int,
         detections: List[Detection],
+        predicted_position: Optional[Tuple[float, float]] = None,
     ) -> Optional[TrackPoint]:
-        predicted_position = None
-
-        if self.initialized:
+        if self.initialized and predicted_position is None:
             predicted_position = self.predict()
 
         selected_detection = self.select_detection(detections, predicted_position)

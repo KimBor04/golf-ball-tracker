@@ -10,14 +10,14 @@ def main() -> None:
         project_root
         / "output"
         / "detections"
-        / "rory_002"
+        / "rory_001"
         / "annotated_frames"
     )
     output_video_path = (
         project_root
         / "output"
         / "detections"
-        / "rory_002"
+        / "rory_001"
         / "annotated_tracking.mp4"
     )
 
