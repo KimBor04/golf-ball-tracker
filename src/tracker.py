@@ -31,27 +31,52 @@ class Detection:
         return cx, cy
 
 
+# ─────────────────────────────────────────────
+# Kalman noise profiles
+# ─────────────────────────────────────────────
+
+# Pre-launch: ball is stationary on tee — very low process noise so the
+# filter stays locked and doesn't drift.
+_PROCESS_NOISE_PRE_LAUNCH = 1e-2
+_MEASUREMENT_NOISE_PRE_LAUNCH = 1e-1
+
+# Post-launch: ball is moving 150-400 px/frame. High process noise lets
+# the Kalman velocity state update aggressively frame-by-frame instead of
+# lagging far behind the real trajectory.
+_PROCESS_NOISE_POST_LAUNCH = 5e2
+_MEASUREMENT_NOISE_POST_LAUNCH = 1e1
+
+# Post-launch distance gate: ball can jump 400px in one frame, so we open
+# the gate wide. Pre-launch we keep it tight so noise doesn't hijack it.
+_DISTANCE_THRESHOLD_PRE_LAUNCH = 80.0
+_DISTANCE_THRESHOLD_POST_LAUNCH = 600.0
+
+
 class BallTracker:
     """
-    Simple single-object Kalman tracker for golf ball tracking.
+    Single-object Kalman tracker for a golf ball.
 
-    State:
-        x, y, vx, vy
+    State  : x, y, vx, vy
+    Measurement: x, y
 
-    Measurement:
-        x, y
+    Two operating modes selected by set_launched():
+      - pre-launch : tight noise, nearest-to-prediction selection
+      - post-launch: loose noise, highest-confidence selection
+        (the ball moves 150-400 px/frame so "nearest" is meaningless;
+         highest confidence correctly picks the real ball over debris)
     """
 
     def __init__(
         self,
         max_missed: int = 10,
-        distance_threshold: float = 80.0,
+        distance_threshold: float = 80.0,   # kept for API compat; overridden internally
     ) -> None:
         self.max_missed = max_missed
-        self.distance_threshold = distance_threshold
+        self._launched = False
 
         self.kalman = cv2.KalmanFilter(4, 2)
 
+        # Constant-velocity transition: x' = x + vx, y' = y + vy
         self.kalman.transitionMatrix = np.array(
             [
                 [1, 0, 1, 0],
@@ -70,20 +95,49 @@ class BallTracker:
             dtype=np.float32,
         )
 
-        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
-        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
+        self._apply_noise_profile(launched=False)
         self.kalman.errorCovPost = np.eye(4, dtype=np.float32)
 
         self.initialized = False
         self.missed_frames = 0
         self.history: List[TrackPoint] = []
 
+    # ── noise / mode ────────────────────────────────────────────────────────
+
+    def _apply_noise_profile(self, launched: bool) -> None:
+        if launched:
+            pn = _PROCESS_NOISE_POST_LAUNCH
+            mn = _MEASUREMENT_NOISE_POST_LAUNCH
+        else:
+            pn = _PROCESS_NOISE_PRE_LAUNCH
+            mn = _MEASUREMENT_NOISE_PRE_LAUNCH
+
+        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * pn
+        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * mn
+
+    def set_launched(self) -> None:
+        """Call this once when launch is detected to switch Kalman profile."""
+        if self._launched:
+            return
+        self._launched = True
+        self._apply_noise_profile(launched=True)
+
+    @property
+    def _distance_threshold(self) -> float:
+        return (
+            _DISTANCE_THRESHOLD_POST_LAUNCH
+            if self._launched
+            else _DISTANCE_THRESHOLD_PRE_LAUNCH
+        )
+
+    # ── public interface ─────────────────────────────────────────────────────
+
     def is_initialized(self) -> bool:
         return self.initialized
 
     def initialize(self, x: float, y: float) -> None:
         self.kalman.statePost = np.array(
-            [[x], [y], [0], [0]],
+            [[x], [y], [0.0], [0.0]],
             dtype=np.float32,
         )
         self.initialized = True
@@ -91,17 +145,13 @@ class BallTracker:
 
     def predict(self) -> Tuple[float, float]:
         predicted = self.kalman.predict()
-        px = float(predicted[0, 0])
-        py = float(predicted[1, 0])
-        return px, py
+        return float(predicted[0, 0]), float(predicted[1, 0])
 
     def update(self, x: float, y: float) -> Tuple[float, float]:
         measurement = np.array([[x], [y]], dtype=np.float32)
         corrected = self.kalman.correct(measurement)
-        cx = float(corrected[0, 0])
-        cy = float(corrected[1, 0])
         self.missed_frames = 0
-        return cx, cy
+        return float(corrected[0, 0]), float(corrected[1, 0])
 
     def mark_missed(self) -> None:
         self.missed_frames += 1
@@ -116,17 +166,11 @@ class BallTracker:
     def get_position(self) -> Optional[Tuple[float, float]]:
         if not self.initialized:
             return None
-
         state = self.kalman.statePost
-        x = float(state[0, 0])
-        y = float(state[1, 0])
-        return x, y
+        return float(state[0, 0]), float(state[1, 0])
 
     @staticmethod
-    def _distance(
-        p1: Tuple[float, float],
-        p2: Tuple[float, float],
-    ) -> float:
+    def _distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
         return float(np.hypot(p1[0] - p2[0], p1[1] - p2[1]))
 
     def select_detection(
@@ -135,32 +179,44 @@ class BallTracker:
         predicted_position: Optional[Tuple[float, float]],
     ) -> Optional[Detection]:
         """
-        Rules:
-        - before initialization: highest confidence
-        - after initialization: nearest to predicted position, if within threshold
+        Pre-launch : pick the detection nearest to the predicted position
+                     (ball is stationary; proximity == correctness).
+        Post-launch: pick the detection with the highest confidence
+                     (ball moves 150-400 px/frame so proximity is useless;
+                     the real ball is the most confidently detected blob
+                     anywhere in the frame).
+        In both modes a distance gate still applies to avoid wild outliers.
         """
         if not detections:
             return None
 
         if not self.initialized or predicted_position is None:
-            return max(detections, key=lambda det: det.confidence)
+            return max(detections, key=lambda d: d.confidence)
 
-        best_detection = None
-        best_distance = float("inf")
+        if self._launched:
+            # Highest confidence wins — but still reject anything impossibly far.
+            candidates = [
+                d for d in detections
+                if self._distance(d.center, predicted_position) <= self._distance_threshold
+            ]
+            if not candidates:
+                # Relax gate completely if nothing passes — better a weak
+                # detection than a miss.
+                candidates = detections
+            return max(candidates, key=lambda d: d.confidence)
 
-        for detection in detections:
-            distance = self._distance(detection.center, predicted_position)
-            if distance < best_distance:
-                best_distance = distance
-                best_detection = detection
+        # Pre-launch: nearest within threshold.
+        best: Optional[Detection] = None
+        best_dist = float("inf")
+        for d in detections:
+            dist = self._distance(d.center, predicted_position)
+            if dist < best_dist:
+                best_dist = dist
+                best = d
 
-        if best_detection is None:
+        if best is None or best_dist > self._distance_threshold:
             return None
-
-        if best_distance > self.distance_threshold:
-            return None
-
-        return best_detection
+        return best
 
     def step(
         self,
@@ -171,35 +227,32 @@ class BallTracker:
         if self.initialized and predicted_position is None:
             predicted_position = self.predict()
 
-        selected_detection = self.select_detection(detections, predicted_position)
+        selected = self.select_detection(detections, predicted_position)
 
         if not self.initialized:
-            if selected_detection is None:
+            if selected is None:
                 return None
-
-            x, y = selected_detection.center
+            x, y = selected.center
             self.initialize(x, y)
-
             point = TrackPoint(
                 frame_idx=frame_idx,
                 x=x,
                 y=y,
                 source="detected",
-                confidence=selected_detection.confidence,
+                confidence=selected.confidence,
             )
             self.history.append(point)
             return point
 
-        if selected_detection is not None:
-            x, y = selected_detection.center
-            corrected_x, corrected_y = self.update(x, y)
-
+        if selected is not None:
+            x, y = selected.center
+            cx, cy = self.update(x, y)
             point = TrackPoint(
                 frame_idx=frame_idx,
-                x=corrected_x,
-                y=corrected_y,
+                x=cx,
+                y=cy,
                 source="detected",
-                confidence=selected_detection.confidence,
+                confidence=selected.confidence,
             )
             self.history.append(point)
             return point
@@ -210,14 +263,14 @@ class BallTracker:
             self.reset()
             return None
 
-        fallback_position = self.get_position()
-        if fallback_position is None:
+        fallback = self.get_position()
+        if fallback is None:
             return None
 
         point = TrackPoint(
             frame_idx=frame_idx,
-            x=fallback_position[0],
-            y=fallback_position[1],
+            x=fallback[0],
+            y=fallback[1],
             source="predicted",
             confidence=None,
         )
@@ -229,17 +282,11 @@ class BallTracker:
 
 
 def yolo_result_to_detections(result) -> List[Detection]:
-    """
-    Convert one Ultralytics result object into Detection objects.
-    """
     detections: List[Detection] = []
-
     if result.boxes is None or len(result.boxes) == 0:
         return detections
-
     xyxy = result.boxes.xyxy.cpu().numpy()
     confs = result.boxes.conf.cpu().numpy()
-
     for box, conf in zip(xyxy, confs):
         x1, y1, x2, y2 = box.tolist()
         detections.append(
@@ -251,5 +298,4 @@ def yolo_result_to_detections(result) -> List[Detection]:
                 confidence=float(conf),
             )
         )
-
     return detections
